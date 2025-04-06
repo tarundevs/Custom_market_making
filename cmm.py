@@ -100,145 +100,107 @@ class MarketMaking(ScriptStrategyBase):
         # Calculate average price over a period (last 60 candles)
         df = self.candles.candles_df
         if df is not None and len(df) >= 60:
-            avg_price = Decimal(str(df['close'].tail(60).mean()))
-            price_deviation = abs((mid_price / avg_price) - Decimal("1.0"))
-            self.logger().info(f"Average price (60 candles): {avg_price}, Current deviation: {price_deviation}")
+            ema12 = df['close'].tail(60).ewm(span=12, adjust=False).mean()
+            ema26 = df['close'].tail(60).ewm(span=26, adjust=False).mean()
+            macd_line = ema12 - ema26
+            signal_line = macd_line.ewm(span=9, adjust=False).mean()
+            
+            if macd_line.iloc[-1] < signal_line.iloc[-1]:
+                market_trend = "downtrend"
+            elif macd_line.iloc[-1] > signal_line.iloc[-1]:
+                market_trend = "uptrend"
+            else:
+                market_trend = "neutral"
+            
+            self.logger().info(f"Market trend: {market_trend}")
         else:
-            avg_price = mid_price
-            price_deviation = Decimal("0")
-            self.logger().warning("Insufficient candle data for average price calculation")
+            market_trend = "neutral"
+            self.logger().warning("Insufficient candle data for trend analysis")
         
-        # Get market direction
-        market_direction = self.predict_market_direction()
-        self.logger().info(f"Market direction prediction: {market_direction}")
-        
-        # Check if we have enough balance for orders
         current_eth = connector.get_balance("ETH")
         current_usdt = connector.get_balance("USDT")
-        estimated_cost = self.order_amount * mid_price
+        volume_amount = Decimal("30")
+        fees_per_volume = Decimal("0.001")
+        min_profit_margin = Decimal("0.005")
         
-        # Calculate how many orders we can place based on our max limit
-        max_orders = 16
-        current_active_orders = len(self.get_active_orders(connector_name=self.exchange))
-        available_order_slots = max_orders - current_active_orders
-        
-        # Calculate order imbalance
         buy_sell_imbalance = self.total_buys - self.total_sells
+        self.logger().info(f"Current buy-sell imbalance: {buy_sell_imbalance}")
         
-        # Calculate average buy price if we have filled buys
-        if self.filled_buy_prices and len(self.filled_buy_prices) > 0:
-            avg_buy_price = sum(self.filled_buy_prices) / len(self.filled_buy_prices)
-            self.logger().info(f"Average buy price from filled orders: {avg_buy_price}")
-        else:
-            avg_buy_price = None
-            self.logger().info("No filled buy orders yet to calculate average price")
-        
-        # MODIFIED LOGIC:
-        # 1. In BULLISH market: Buy at MARKET price
-        # 2. In BEARISH market: Buy at limit with discount
-        # 3. NEVER sell below buy price - CRITICAL CHANGE
-        
-        if market_direction == "bullish":
-            # BULLISH MARKET STRATEGY
-            
-            # Place MARKET buy orders in bullish market
-            if buy_sell_imbalance < 5 and current_usdt >= estimated_cost:
-                max_buy_orders = min(2, available_order_slots)  # Limit to 2 market buys at a time
-                max_buy_orders = min(max_buy_orders, int(current_usdt / estimated_cost))
+        if market_trend == "downtrend":
+            if current_eth >= volume_amount:
+                ask_price = mid_price
+                self.logger().info(f"Downtrend: Selling {volume_amount} ETH at {ask_price}")
+                orders.append(OrderCandidate(
+                    trading_pair=self.trading_pair,
+                    is_maker=False,
+                    order_type=OrderType.MARKET,
+                    order_side=TradeType.SELL,
+                    amount=volume_amount,
+                    price=Decimal("0")
+                ))
                 
-                if max_buy_orders > 0:
-                    self.logger().info(f"Bullish market detected. Placing {max_buy_orders} MARKET buy orders.")
-                    for i in range(max_buy_orders):
-                        # Market orders use 0 as price in Hummingbot
-                        orders.append(OrderCandidate(
-                            trading_pair=self.trading_pair,
-                            is_maker=False,  # Market orders are taker orders
-                            order_type=OrderType.MARKET,
-                            order_side=TradeType.BUY,
-                            amount=self.order_amount,
-                            price=Decimal("0")  # Price is determined by the market
-                        ))
-                    self.ping_pong_active = True
-                    self.initial_buy_price = mid_price
-                    self.logger().info(f"Market buy orders proposed at approximately: {mid_price}")
-                else:
-                    self.logger().info(f"No buy orders: Either buy-sell imbalance ({buy_sell_imbalance}) too high or insufficient USDT ({current_usdt})")
-        
-        elif market_direction == "bearish":
-            # BEARISH MARKET STRATEGY
-            
-            # Place limit buy orders with discount in bearish market
-            if current_usdt >= estimated_cost:
-                max_buy_orders = min(2, available_order_slots)
-                max_buy_orders = min(max_buy_orders, int(current_usdt / estimated_cost))
+                bid_price = (ask_price - (min_profit_margin + fees_per_volume) * volume_amount).quantize(price_precision)
+                self.logger().info(f"Downtrend: Setting buy-back order at {bid_price}")
+                orders.append(OrderCandidate(
+                    trading_pair=self.trading_pair,
+                    is_maker=True,
+                    order_type=OrderType.LIMIT,
+                    order_side=TradeType.BUY,
+                    amount=volume_amount,
+                    price=bid_price
+                ))
+        elif market_trend == "uptrend":
+            if current_usdt >= volume_amount * mid_price:
+                bid_price = mid_price
+                self.logger().info(f"Uptrend: Buying {volume_amount} ETH at {bid_price}")
+                orders.append(OrderCandidate(
+                    trading_pair=self.trading_pair,
+                    is_maker=False,
+                    order_type=OrderType.MARKET,
+                    order_side=TradeType.BUY,
+                    amount=volume_amount,
+                    price=Decimal("0")
+                ))
                 
-                if max_buy_orders > 0:
-                    self.logger().info(f"Bearish market. Placing {max_buy_orders} discounted limit buy orders.")
-                    for i in range(max_buy_orders):
-                        # Calculate buy price with a significant discount to ensure profitability
-                        # Use larger discounts in bearish markets
-                        discount = Decimal("0.01") + Decimal(str(i * 0.005))  # Start with 1% discount
-                        buy_price = (mid_price * (Decimal("1.0") - discount)).quantize(price_precision)
-                        
-                        # If we have average sell price, make sure our buy price is sufficiently lower
-                        if self.filled_sell_prices and len(self.filled_sell_prices) > 0:
-                            avg_sell = sum(self.filled_sell_prices) / len(self.filled_sell_prices)
-                            max_buy_price = avg_sell * (Decimal("1.0") - Decimal("0.005"))  # At least 0.5% below avg sell
-                            if buy_price > max_buy_price:
-                                buy_price = max_buy_price.quantize(price_precision)
-                        
-                        self.logger().info(f"Discounted buy order {i+1} price: {buy_price} (discount: {discount*100}%)")
-                        
-                        orders.append(OrderCandidate(
-                            trading_pair=self.trading_pair,
-                            is_maker=True,
-                            order_type=OrderType.LIMIT,
-                            order_side=TradeType.BUY,
-                            amount=self.order_amount,
-                            price=buy_price
-                        ))
-        
-        # SELL LOGIC - Completely separated and with strict profit enforcement
-        # Only place sell orders if we have ETH to sell and have completed buys
-        if current_eth >= self.order_amount and self.total_buys > self.total_sells and avg_buy_price is not None:
-            sell_imbalance = self.total_buys - self.total_sells
-            max_sell_orders = min(sell_imbalance, available_order_slots)
-            max_sell_orders = min(max_sell_orders, int(current_eth / self.order_amount))
+                ask_price = (bid_price + (min_profit_margin + fees_per_volume) * volume_amount).quantize(price_precision)
+                self.logger().info(f"Uptrend: Setting sell-back order at {ask_price}")
+                orders.append(OrderCandidate(
+                    trading_pair=self.trading_pair,
+                    is_maker=True,
+                    order_type=OrderType.LIMIT,
+                    order_side=TradeType.SELL,
+                    amount=volume_amount,
+                    price=ask_price
+                ))
+        else:  # Neutral market
+            buy_price = (mid_price - (min_profit_margin + fees_per_volume)).quantize(price_precision)
+            sell_price = (mid_price + (min_profit_margin + fees_per_volume)).quantize(price_precision)
             
-            if max_sell_orders > 0:
-                # Calculate minimum profitable sell price with a 1% markup over average buy price
-                # This is higher than before to ensure profitability
-                min_markup = Decimal("0.01")  # 1% minimum markup
-                min_sell_price = avg_buy_price * (Decimal("1.0") + min_markup)
-                
-                # Only place sell orders if current market price is above our minimum sell price
-                if mid_price >= min_sell_price:
-                    self.logger().info(f"Placing {max_sell_orders} limit sell orders with guaranteed profit")
-                    for i in range(max_sell_orders):
-                        # Calculate sell price with increasing markup
-                        markup = min_markup + Decimal(str(i * 0.003))  # Increased markup steps
-                        sell_price = (avg_buy_price * (Decimal("1.0") + markup)).quantize(price_precision)
-                        
-                        # Double-check that sell price is above avg buy price with markup
-                        if sell_price <= avg_buy_price:
-                            self.logger().warning(f"Calculated sell price {sell_price} not profitable compared to avg buy {avg_buy_price}. Adjusting.")
-                            sell_price = (avg_buy_price * (Decimal("1.0") + min_markup + Decimal("0.005"))).quantize(price_precision)
-                        
-                        self.logger().info(f"Limit sell order {i+1} price: {sell_price} (markup: {markup*100}% above avg buy of {avg_buy_price})")
-                        
-                        orders.append(OrderCandidate(
-                            trading_pair=self.trading_pair,
-                            is_maker=True,
-                            order_type=OrderType.LIMIT,
-                            order_side=TradeType.SELL,
-                            amount=self.order_amount,
-                            price=sell_price
-                        ))
-                else:
-                    self.logger().info(f"Current price ({mid_price}) is below minimum profitable sell price ({min_sell_price}). Not placing sell orders.")
+            if current_eth < volume_amount * 2 and current_usdt >= volume_amount * mid_price:
+                self.logger().info(f"Neutral market: Placing buy order at {buy_price} for inventory management")
+                orders.append(OrderCandidate(
+                    trading_pair=self.trading_pair,
+                    is_maker=True,
+                    order_type=OrderType.LIMIT,
+                    order_side=TradeType.BUY,
+                    amount=volume_amount / 2,
+                    price=buy_price
+                ))
+            
+            if current_eth >= volume_amount:
+                self.logger().info(f"Neutral market: Placing sell order at {sell_price} for inventory management")
+                orders.append(OrderCandidate(
+                    trading_pair=self.trading_pair,
+                    is_maker=True,
+                    order_type=OrderType.LIMIT,
+                    order_side=TradeType.SELL,
+                    amount=volume_amount / 2,
+                    price=sell_price
+                ))
         
-        self.logger().info(f"Proposal created with {len(orders)} orders. Total active orders will be {current_active_orders + len(orders)}")
+        self.logger().info(f"Proposal created with {len(orders)} orders.")
         return orders
+
 
 
     def adjust_proposal_to_budget(self, proposal):
