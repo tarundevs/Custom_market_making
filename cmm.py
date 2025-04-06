@@ -97,9 +97,18 @@ class MarketMaking(ScriptStrategyBase):
         
         orders = []
         
+        # Initialize tracking variables if they don't exist
+        if not hasattr(self, 'max_bid_price'):
+            self.max_bid_price = Decimal("0")
+        if not hasattr(self, 'min_ask_price'):
+            self.min_ask_price = Decimal("999999999")
+        if not hasattr(self, 'price_buffer'):
+            self.price_buffer = Decimal("0.01")  # Increased buffer to 1% from 0.2%
+        
         # Calculate average price over a period (last 60 candles)
         df = self.candles.candles_df
         if df is not None and len(df) >= 60:
+            # Use MACD for trend analysis
             ema12 = df['close'].tail(60).ewm(span=12, adjust=False).mean()
             ema26 = df['close'].tail(60).ewm(span=26, adjust=False).mean()
             macd_line = ema12 - ema26
@@ -112,71 +121,117 @@ class MarketMaking(ScriptStrategyBase):
             else:
                 market_trend = "neutral"
             
-            self.logger().info(f"Market trend: {market_trend}")
+            self.logger().info(f"60s Market trend: {market_trend}")
+            
+            # Calculate 5-minute prediction
+            short_term_ema = df['close'].tail(5).ewm(span=3, adjust=False).mean()
+            if short_term_ema.iloc[-1] > short_term_ema.iloc[-2]:
+                short_term_trend = "up"
+            elif short_term_ema.iloc[-1] < short_term_ema.iloc[-2]:
+                short_term_trend = "down"
+            else:
+                short_term_trend = "neutral"
+            
+            self.logger().info(f"5s Market prediction: {short_term_trend}")
         else:
             market_trend = "neutral"
+            short_term_trend = "neutral"
             self.logger().warning("Insufficient candle data for trend analysis")
         
         current_eth = connector.get_balance("ETH")
         current_usdt = connector.get_balance("USDT")
-        volume_amount = Decimal("30")
+        volume_amount = Decimal("15")
         fees_per_volume = Decimal("0.001")
-        min_profit_margin = Decimal("0.005")
+        min_profit_margin = Decimal("0.01")  # Increased from 0.005 to 0.01 (1%)
         
         buy_sell_imbalance = self.total_buys - self.total_sells
         self.logger().info(f"Current buy-sell imbalance: {buy_sell_imbalance}")
         
+        # Track extreme prices
+        if not hasattr(self, 'max_price'):
+            self.max_price = mid_price
+        if not hasattr(self, 'min_price'):
+            self.min_price = mid_price
+        
+        self.max_price = max(self.max_price, mid_price)
+        self.min_price = min(self.min_price, mid_price)
+        
+        # Calculate average buy and sell prices
+        avg_buy_price = sum(self.filled_buy_prices) / len(self.filled_buy_prices) if self.filled_buy_prices else None
+        avg_sell_price = sum(self.filled_sell_prices) / len(self.filled_sell_prices) if self.filled_sell_prices else None
+        
+        if avg_sell_price and avg_buy_price:
+            if avg_sell_price > avg_buy_price:
+                self.logger().info(f"PROFITABLE: Average sell price ({avg_sell_price}) is higher than average buy price ({avg_buy_price})")
+            else:
+                self.logger().warning(f"UNPROFITABLE: Average sell price ({avg_sell_price}) is lower than average buy price ({avg_buy_price})")
+                # Adjust buffer if we're unprofitable
+                self.price_buffer = max(self.price_buffer, Decimal("0.015"))  # Increase buffer to at least 1.5%
+        
+        # STRICT ENFORCEMENT: Never allow sell price below max bid price + buffer
+        # Never allow buy price above min ask price - buffer
+        
         if market_trend == "downtrend":
             if current_eth >= volume_amount:
-                ask_price = mid_price
-                self.logger().info(f"Downtrend: Selling {volume_amount} ETH at {ask_price}")
-                orders.append(OrderCandidate(
-                    trading_pair=self.trading_pair,
-                    is_maker=False,
-                    order_type=OrderType.MARKET,
-                    order_side=TradeType.SELL,
-                    amount=volume_amount,
-                    price=Decimal("0")
-                ))
+                potential_ask_price = max(mid_price, (avg_buy_price * (Decimal("1") + min_profit_margin + fees_per_volume)) if avg_buy_price else mid_price)
                 
-                bid_price = (ask_price - (min_profit_margin + fees_per_volume) * volume_amount).quantize(price_precision)
-                self.logger().info(f"Downtrend: Setting buy-back order at {bid_price}")
+                # CRITICAL: Ensure ask price is above max bid price plus buffer
+                if potential_ask_price <= self.max_bid_price * (Decimal("1") + self.price_buffer):
+                    potential_ask_price = self.max_bid_price * (Decimal("1") + self.price_buffer)
+                    self.logger().info(f"Adjusted ask price to maintain buffer above max bid: {potential_ask_price}")
+                
+                # Ensure we're not selling at a loss compared to our average buy price
+                if avg_buy_price and potential_ask_price <= avg_buy_price * (Decimal("1") + fees_per_volume * Decimal("2")):
+                    potential_ask_price = avg_buy_price * (Decimal("1") + fees_per_volume * Decimal("2") + min_profit_margin)
+                    self.logger().info(f"Adjusted ask price to ensure profit: {potential_ask_price}")
+                
+                self.min_ask_price = min(self.min_ask_price, potential_ask_price)
+                
+                self.logger().info(f"Downtrend: Selling {volume_amount} ETH at {potential_ask_price}")
                 orders.append(OrderCandidate(
                     trading_pair=self.trading_pair,
                     is_maker=True,
                     order_type=OrderType.LIMIT,
-                    order_side=TradeType.BUY,
+                    order_side=TradeType.SELL,
                     amount=volume_amount,
-                    price=bid_price
+                    price=potential_ask_price.quantize(price_precision)
                 ))
+        
         elif market_trend == "uptrend":
             if current_usdt >= volume_amount * mid_price:
-                bid_price = mid_price
-                self.logger().info(f"Uptrend: Buying {volume_amount} ETH at {bid_price}")
-                orders.append(OrderCandidate(
-                    trading_pair=self.trading_pair,
-                    is_maker=False,
-                    order_type=OrderType.MARKET,
-                    order_side=TradeType.BUY,
-                    amount=volume_amount,
-                    price=Decimal("0")
-                ))
+                potential_bid_price = min(mid_price, (avg_sell_price * (Decimal("1") - min_profit_margin - fees_per_volume)) if avg_sell_price else mid_price)
                 
-                ask_price = (bid_price + (min_profit_margin + fees_per_volume) * volume_amount).quantize(price_precision)
-                self.logger().info(f"Uptrend: Setting sell-back order at {ask_price}")
+                # CRITICAL: Ensure bid price is below min ask price minus buffer
+                if potential_bid_price >= self.min_ask_price * (Decimal("1") - self.price_buffer):
+                    potential_bid_price = self.min_ask_price * (Decimal("1") - self.price_buffer)
+                    self.logger().info(f"Adjusted bid price to maintain buffer below min ask: {potential_bid_price}")
+                
+                self.max_bid_price = max(self.max_bid_price, potential_bid_price)
+                
+                self.logger().info(f"Uptrend: Buying {volume_amount} ETH at {potential_bid_price}")
                 orders.append(OrderCandidate(
                     trading_pair=self.trading_pair,
                     is_maker=True,
                     order_type=OrderType.LIMIT,
-                    order_side=TradeType.SELL,
+                    order_side=TradeType.BUY,
                     amount=volume_amount,
-                    price=ask_price
+                    price=potential_bid_price.quantize(price_precision)
                 ))
-        else:  # Neutral market
-            buy_price = (mid_price - (min_profit_margin + fees_per_volume)).quantize(price_precision)
-            sell_price = (mid_price + (min_profit_margin + fees_per_volume)).quantize(price_precision)
-            
-            if current_eth < volume_amount * 2 and current_usdt >= volume_amount * mid_price:
+        
+          
+        # Neutral market - inventory management with buffer enforcement
+        if market_trend == "neutral":
+            inventory_target = volume_amount * 2
+            if current_eth < inventory_target and current_usdt >= volume_amount * mid_price:
+                buy_price = (mid_price * (Decimal("1") - fees_per_volume - Decimal("0.001"))).quantize(price_precision)
+                
+                # Ensure buy price doesn't overlap with min ask
+                if buy_price >= self.min_ask_price * (Decimal("1") - self.price_buffer):
+                    buy_price = self.min_ask_price * (Decimal("1") - self.price_buffer)
+                    self.logger().info(f"Adjusted neutral buy price to maintain buffer: {buy_price}")
+                
+                self.max_bid_price = max(self.max_bid_price, buy_price)
+                
                 self.logger().info(f"Neutral market: Placing buy order at {buy_price} for inventory management")
                 orders.append(OrderCandidate(
                     trading_pair=self.trading_pair,
@@ -187,7 +242,22 @@ class MarketMaking(ScriptStrategyBase):
                     price=buy_price
                 ))
             
-            if current_eth >= volume_amount:
+            if current_eth > inventory_target:
+                # Only place sell orders if they're profitable
+                sell_price = (mid_price * (Decimal("1") + fees_per_volume + Decimal("0.001") + min_profit_margin)).quantize(price_precision)
+                
+                # Ensure sell price doesn't overlap with max bid
+                if sell_price <= self.max_bid_price * (Decimal("1") + self.price_buffer):
+                    sell_price = self.max_bid_price * (Decimal("1") + self.price_buffer)
+                    self.logger().info(f"Adjusted neutral sell price to maintain buffer: {sell_price}")
+                
+                # Ensure we're not selling at a loss compared to our average buy price
+                if avg_buy_price and sell_price <= avg_buy_price * (Decimal("1") + fees_per_volume * Decimal("2")):
+                    sell_price = avg_buy_price * (Decimal("1") + fees_per_volume * Decimal("2") + min_profit_margin)
+                    self.logger().info(f"Adjusted neutral sell price to ensure profit: {sell_price}")
+                
+                self.min_ask_price = min(self.min_ask_price, sell_price)
+                
                 self.logger().info(f"Neutral market: Placing sell order at {sell_price} for inventory management")
                 orders.append(OrderCandidate(
                     trading_pair=self.trading_pair,
@@ -198,9 +268,59 @@ class MarketMaking(ScriptStrategyBase):
                     price=sell_price
                 ))
         
+        # Extreme price actions - MODIFIED to respect buffer and profitability
+        if mid_price >= self.max_price * Decimal("0.99"):  # Within 1% of max price
+            if current_eth > volume_amount:
+                extreme_sell_price = mid_price
+                
+                # Only sell at extreme prices if it's profitable
+                if avg_buy_price is None or extreme_sell_price > avg_buy_price * (Decimal("1") + fees_per_volume * Decimal("2") + min_profit_margin):
+                    # Ensure extreme sell price doesn't overlap with max bid
+                    if extreme_sell_price <= self.max_bid_price * (Decimal("1") + self.price_buffer):
+                        extreme_sell_price = self.max_bid_price * (Decimal("1") + self.price_buffer)
+                        self.logger().info(f"Adjusted extreme sell price to maintain buffer: {extreme_sell_price}")
+                    
+                    self.min_ask_price = min(self.min_ask_price, extreme_sell_price)
+                    
+                    self.logger().info(f"Extreme bullish price: Selling all available ETH at market price")
+                    orders.append(OrderCandidate(
+                        trading_pair=self.trading_pair,
+                        is_maker=False,
+                        order_type=OrderType.MARKET,
+                        order_side=TradeType.SELL,
+                        amount=current_eth,
+                        price=Decimal("0")
+                    ))
+                else:
+                    self.logger().info(f"Skipped extreme sell due to unprofitability")
+        elif mid_price <= self.min_price * Decimal("1.01"):  # Within 1% of min price
+            if current_usdt >= volume_amount * mid_price:
+                extreme_buy_price = mid_price
+                
+                # Ensure extreme buy price doesn't overlap with min ask
+                if extreme_buy_price >= self.min_ask_price * (Decimal("1") - self.price_buffer):
+                    extreme_buy_price = self.min_ask_price * (Decimal("1") - self.price_buffer)
+                    self.logger().info(f"Adjusted extreme buy price to maintain buffer: {extreme_buy_price}")
+                
+                self.max_bid_price = max(self.max_bid_price, extreme_buy_price)
+                
+                self.logger().info(f"Extreme bearish price: Buying to maintain inventory at market price")
+                orders.append(OrderCandidate(
+                    trading_pair=self.trading_pair,
+                    is_maker=False,
+                    order_type=OrderType.MARKET,
+                    order_side=TradeType.BUY,
+                    amount=volume_amount,
+                    price=Decimal("0")
+                ))
+        
+        # Log the current bid-ask tracking values
+        self.logger().info(f"Current max bid price: {self.max_bid_price}")
+        self.logger().info(f"Current min ask price: {self.min_ask_price}")
+        self.logger().info(f"Current price buffer: {self.price_buffer}")
         self.logger().info(f"Proposal created with {len(orders)} orders.")
+        
         return orders
-
 
 
     def adjust_proposal_to_budget(self, proposal):
