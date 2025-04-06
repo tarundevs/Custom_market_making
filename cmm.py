@@ -51,7 +51,6 @@ class MarketMaking(ScriptStrategyBase):
             mid_price = Decimal(str(connector.get_mid_price(self.trading_pair)))
             self.logger().info(f"Tick at timestamp: {self.current_timestamp}, Mid Price: {mid_price}")
             if self.create_timestamp <= self.current_timestamp:
-                self.update_market_state()
                 self.cancel_all_orders()
                 proposal = self.create_proposal()
                 proposal_adjusted = self.adjust_proposal_to_budget(proposal)
@@ -65,25 +64,6 @@ class MarketMaking(ScriptStrategyBase):
                 
         except Exception as e:
             self.logger().error(f"Error in on_tick: {e}", exc_info=True)
-
-    def update_market_state(self):
-        market_prediction = self.predict_market_direction()
-        self.logger().info(f"Market prediction value: {market_prediction}")
-        
-        if market_prediction == 1:
-            self.trend_state = "Strong Bullish"
-        elif market_prediction == 0.5:
-            self.trend_state = "Moderate Bullish"
-        elif market_prediction == -1:
-            self.trend_state = "Strong Bearish"
-        elif market_prediction == -0.5:
-            self.trend_state = "Moderate Bearish"
-        else:
-            self.trend_state = "Neutral"
-        
-        connector = self.connectors[self.exchange]
-        self.last_mid_price = Decimal(str(connector.get_mid_price(self.trading_pair)))
-        self.logger().info(f"Updated market state to: {self.trend_state}, Last mid price: {self.last_mid_price}")
 
     def create_proposal(self):
         connector = self.connectors[self.exchange]
@@ -105,44 +85,53 @@ class MarketMaking(ScriptStrategyBase):
         if not hasattr(self, 'price_buffer'):
             self.price_buffer = Decimal("0.01")  # Increased buffer to 1% from 0.2%
         
-        # Calculate average price over a period (last 60 candles)
+        # Calculate market indicators
         df = self.candles.candles_df
+        market_trend = "neutral"
+        short_term_trend = "neutral"
         if df is not None and len(df) >= 60:
-            # Use MACD for trend analysis
-            ema12 = df['close'].tail(60).ewm(span=12, adjust=False).mean()
-            ema26 = df['close'].tail(60).ewm(span=26, adjust=False).mean()
-            macd_line = ema12 - ema26
-            signal_line = macd_line.ewm(span=9, adjust=False).mean()
+            # Use OBI for order book analysis
+            obi = self.OBI()
+            self.logger().info(f"Order Book Imbalance: {obi}")
             
-            if macd_line.iloc[-1] < signal_line.iloc[-1]:
+            # Use Volume Weighted Imbalance for trend analysis
+            vwi = self.volume_weighted_imbalance(df)
+            self.logger().info(f"Volume Weighted Imbalance: {vwi}")
+            
+            # Calculate bid-ask spread
+            spread_pct = self.bid_ask_spread()
+            self.logger().info(f"Bid-Ask Spread %: {spread_pct}")
+            
+            # Calculate short-term volatility
+            volatility = self.short_term_volatility(df)
+            self.logger().info(f"Short-term volatility: {volatility}")
+            
+            # Determine market trend based on OBI and VWI
+            if obi < Decimal("-0.2") and vwi < -0.1:
                 market_trend = "downtrend"
-            elif macd_line.iloc[-1] > signal_line.iloc[-1]:
+            elif obi > Decimal("0.2") and vwi > 0.1:
                 market_trend = "uptrend"
             else:
                 market_trend = "neutral"
+            self.logger().info(f"Market trend: {market_trend}")
             
-            self.logger().info(f"60s Market trend: {market_trend}")
-            
-            # Calculate 5-minute prediction
-            short_term_ema = df['close'].tail(5).ewm(span=3, adjust=False).mean()
-            if short_term_ema.iloc[-1] > short_term_ema.iloc[-2]:
-                short_term_trend = "up"
-            elif short_term_ema.iloc[-1] < short_term_ema.iloc[-2]:
-                short_term_trend = "down"
-            else:
-                short_term_trend = "neutral"
-            
-            self.logger().info(f"5s Market prediction: {short_term_trend}")
+            # Calculate short-term prediction based on volatility and spread
+            if volatility > Decimal("0.02") and spread_pct < Decimal("0.5"):
+                if obi > Decimal("0.1"):
+                    short_term_trend = "up"
+                elif obi < Decimal("-0.1"):
+                    short_term_trend = "down"
+                else:
+                    short_term_trend = "neutral"
+            self.logger().info(f"Short-term prediction: {short_term_trend}")
         else:
-            market_trend = "neutral"
-            short_term_trend = "neutral"
             self.logger().warning("Insufficient candle data for trend analysis")
         
         current_eth = connector.get_balance("ETH")
         current_usdt = connector.get_balance("USDT")
         volume_amount = Decimal("15")
         fees_per_volume = Decimal("0.001")
-        min_profit_margin = Decimal("0.01")  # Increased from 0.005 to 0.01 (1%)
+        min_profit_margin = Decimal("0.01")  # 1% minimum profit margin
         
         buy_sell_imbalance = self.total_buys - self.total_sells
         self.logger().info(f"Current buy-sell imbalance: {buy_sell_imbalance}")
@@ -218,7 +207,6 @@ class MarketMaking(ScriptStrategyBase):
                     price=potential_bid_price.quantize(price_precision)
                 ))
         
-          
         # Neutral market - inventory management with buffer enforcement
         if market_trend == "neutral":
             inventory_target = volume_amount * 2
@@ -322,58 +310,6 @@ class MarketMaking(ScriptStrategyBase):
         
         return orders
 
-
-    def adjust_proposal_to_budget(self, proposal):
-        adjusted_proposal = self.connectors[self.exchange].budget_checker.adjust_candidates(proposal, all_or_none=True)
-        # self.logger().info(f"Adjusted proposal to budget. Original orders: {len(proposal)}, Adjusted orders: {len(adjusted_proposal)}")
-        return adjusted_proposal
-    
-    def place_orders(self, proposal):
-        # self.logger().info(f"Placing {len(proposal)} orders")
-        for order in proposal:
-            self.place_order(connector_name=self.exchange, order=order)
-            self.logger().info(f"Placed order: {order.order_side.name} {order.amount} {order.trading_pair} @ {order.price}")
-    
-    def place_order(self, connector_name, order):
-        if order.order_side == TradeType.SELL:
-            self.sell(connector_name=connector_name, trading_pair=order.trading_pair, 
-                     amount=self.order_amount, order_type=order.order_type, price=order.price)
-        elif order.order_side == TradeType.BUY:
-            self.buy(connector_name=connector_name, trading_pair=order.trading_pair, 
-                    amount=self.order_amount, order_type=order.order_type, price=order.price)
-    
-    def cancel_all_orders(self):
-        active_orders = self.get_active_orders(connector_name=self.exchange)
-        self.logger().info(f"Canceling {len(active_orders)} active orders")
-        for order in active_orders:
-            self.cancel(self.exchange, order.trading_pair, order.client_order_id)
-            self.logger().info(f"Cancelled order: {order.client_order_id}")
-
-    def did_fill_order(self, event: OrderFilledEvent):
-        self.logger().info(f"Order filled: {event.trade_type.name} {round(event.amount, 4)} {event.trading_pair} @ {round(event.price, 2)}")
-        
-        self.trade_history.append(event.trade_type)
-        if len(self.trade_history) > 10:
-            self.trade_history.pop(0)
-        
-        if event.trade_type == TradeType.BUY:
-            self.total_buys += 1
-            self.filled_buy_prices.append(event.price)
-            if len(self.filled_buy_prices) > 20:
-                self.filled_buy_prices.pop(0)
-            if self.initial_buy_price is None or event.price < self.initial_buy_price:
-                self.initial_buy_price = event.price
-            self.logger().info(f"Buy filled. Total buys: {self.total_buys}, Initial buy price updated to: {self.initial_buy_price}")
-        else:  # SELL
-            self.total_sells += 1
-            self.filled_sell_prices.append(event.price)
-            if len(self.filled_sell_prices) > 20:
-                self.filled_sell_prices.pop(0)
-            if self.total_buys == self.total_sells:
-                self.initial_buy_price = None
-                self.ping_pong_active = False
-            self.logger().info(f"Sell filled. Total sells: {self.total_sells}, Ping-pong reset: {not self.ping_pong_active}")
-
     def bid_ask_spread(self):
         try:
             connector = self.connectors[self.exchange]
@@ -446,46 +382,56 @@ class MarketMaking(ScriptStrategyBase):
             self.logger().error(f"Error in short_term_volatility: {e}")
             return Decimal("0")
 
-    def predict_market_direction(self):
-        try:
-            # Get very recent 1s candlestick data
-            # df = self.get_candles()  # Assuming this returns 1s candles
-            df=self.candles.candles_df
-            # Calculate all metrics with emphasis on immediate signals
-            spread = self.bid_ask_spread()
-            obi = self.OBI()
-            vwi = self.volume_weighted_imbalance(df)
-            volatility = self.short_term_volatility(df)
-            
-            # Log the indicators
-            self.logger().debug(f"Market indicators - Spread: {spread}%, OBI: {obi}, VWI: {vwi}, Volatility: {volatility}")
-            
-            # For ultra-short timeframe, prioritize order book and recent volume
-            obi_weight = 0.50  # Order book is crucial for immediate direction
-            vwi_weight = 0.35  # Recent volume imbalance
-            spread_weight = 0.10  # Wider spreads can indicate uncertainty
-            volatility_weight = 0.05  # Less important for 5s prediction
-            
-            # Calculate market score - simplified for quick binary decision
-            market_score = (
-                float(obi) * obi_weight +
-                float(vwi) * vwi_weight -
-                (float(spread) / 10.0) * spread_weight  # Higher spread slightly negative
-            )
-            
-            # Make binary decision - more decisive for short timeframe
-            if market_score > 0:
-                direction = "bullish"
-            else:
-                direction = "bearish"
-                
-            self.logger().info(f"5-second prediction: {direction} (score: {market_score:.4f})")
-            
-            return direction  # Just return "bullish" or "bearish"
-            
-        except Exception as e:
-            self.logger().error(f"Error in predict_market_direction: {e}")
-            return "neutral"  # Default to neutral on error
+    def adjust_proposal_to_budget(self, proposal):
+        adjusted_proposal = self.connectors[self.exchange].budget_checker.adjust_candidates(proposal, all_or_none=True)
+        # self.logger().info(f"Adjusted proposal to budget. Original orders: {len(proposal)}, Adjusted orders: {len(adjusted_proposal)}")
+        return adjusted_proposal
+    
+    def place_orders(self, proposal):
+        # self.logger().info(f"Placing {len(proposal)} orders")
+        for order in proposal:
+            self.place_order(connector_name=self.exchange, order=order)
+            self.logger().info(f"Placed order: {order.order_side.name} {order.amount} {order.trading_pair} @ {order.price}")
+    
+    def place_order(self, connector_name, order):
+        if order.order_side == TradeType.SELL:
+            self.sell(connector_name=connector_name, trading_pair=order.trading_pair, 
+                     amount=self.order_amount, order_type=order.order_type, price=order.price)
+        elif order.order_side == TradeType.BUY:
+            self.buy(connector_name=connector_name, trading_pair=order.trading_pair, 
+                    amount=self.order_amount, order_type=order.order_type, price=order.price)
+    
+    def cancel_all_orders(self):
+        active_orders = self.get_active_orders(connector_name=self.exchange)
+        self.logger().info(f"Canceling {len(active_orders)} active orders")
+        for order in active_orders:
+            self.cancel(self.exchange, order.trading_pair, order.client_order_id)
+            self.logger().info(f"Cancelled order: {order.client_order_id}")
+
+    def did_fill_order(self, event: OrderFilledEvent):
+        self.logger().info(f"Order filled: {event.trade_type.name} {round(event.amount, 4)} {event.trading_pair} @ {round(event.price, 2)}")
+        
+        self.trade_history.append(event.trade_type)
+        if len(self.trade_history) > 10:
+            self.trade_history.pop(0)
+        
+        if event.trade_type == TradeType.BUY:
+            self.total_buys += 1
+            self.filled_buy_prices.append(event.price)
+            if len(self.filled_buy_prices) > 20:
+                self.filled_buy_prices.pop(0)
+            if self.initial_buy_price is None or event.price < self.initial_buy_price:
+                self.initial_buy_price = event.price
+            self.logger().info(f"Buy filled. Total buys: {self.total_buys}, Initial buy price updated to: {self.initial_buy_price}")
+        else:  # SELL
+            self.total_sells += 1
+            self.filled_sell_prices.append(event.price)
+            if len(self.filled_sell_prices) > 20:
+                self.filled_sell_prices.pop(0)
+            if self.total_buys == self.total_sells:
+                self.initial_buy_price = None
+                self.ping_pong_active = False
+            self.logger().info(f"Sell filled. Total sells: {self.total_sells}, Ping-pong reset: {not self.ping_pong_active}")
 
     def format_status(self):
         if not self.ready_to_trade:
@@ -521,8 +467,3 @@ class MarketMaking(ScriptStrategyBase):
         
         self.logger().info("\n" + "\n".join(lines))
         return "\n".join(lines)
-
-if __name__ == "__main__":
-    # This block would typically be handled by the Hummingbot framework
-    # For standalone testing, you would need to mock connectors
-    pass
