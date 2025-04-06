@@ -125,11 +125,24 @@ class MarketMaking(ScriptStrategyBase):
         # Calculate order imbalance
         buy_sell_imbalance = self.total_buys - self.total_sells
         
-        # SIMPLIFIED LOGIC: BUY AT MARKET WHEN BULLISH, SELL AT LIMIT WITH MARKUP
+        # Calculate average buy price if we have filled buys
+        if self.filled_buy_prices and len(self.filled_buy_prices) > 0:
+            avg_buy_price = sum(self.filled_buy_prices) / len(self.filled_buy_prices)
+            self.logger().info(f"Average buy price from filled orders: {avg_buy_price}")
+        else:
+            avg_buy_price = None
+            self.logger().info("No filled buy orders yet to calculate average price")
+        
+        # MODIFIED LOGIC:
+        # 1. In BULLISH market: Buy at MARKET price
+        # 2. In BEARISH market: Buy at limit with discount
+        # 3. NEVER sell below buy price - CRITICAL CHANGE
+        
         if market_direction == "bullish":
-            # Only place buy orders if we don't have too many buys already
+            # BULLISH MARKET STRATEGY
+            
+            # Place MARKET buy orders in bullish market
             if buy_sell_imbalance < 5 and current_usdt >= estimated_cost:
-                # Use MARKET orders for buys
                 max_buy_orders = min(2, available_order_slots)  # Limit to 2 market buys at a time
                 max_buy_orders = min(max_buy_orders, int(current_usdt / estimated_cost))
                 
@@ -148,41 +161,81 @@ class MarketMaking(ScriptStrategyBase):
                     self.ping_pong_active = True
                     self.initial_buy_price = mid_price
                     self.logger().info(f"Market buy orders proposed at approximately: {mid_price}")
-            else:
-                self.logger().info(f"No buy orders: Either buy-sell imbalance ({buy_sell_imbalance}) too high or insufficient USDT ({current_usdt})")
+                else:
+                    self.logger().info(f"No buy orders: Either buy-sell imbalance ({buy_sell_imbalance}) too high or insufficient USDT ({current_usdt})")
         
-        # For sell orders, always use limit orders with markup
-        if current_eth >= self.order_amount and self.total_buys > self.total_sells:
-            # Calculate how many sell orders we can place
+        elif market_direction == "bearish":
+            # BEARISH MARKET STRATEGY
+            
+            # Place limit buy orders with discount in bearish market
+            if current_usdt >= estimated_cost:
+                max_buy_orders = min(2, available_order_slots)
+                max_buy_orders = min(max_buy_orders, int(current_usdt / estimated_cost))
+                
+                if max_buy_orders > 0:
+                    self.logger().info(f"Bearish market. Placing {max_buy_orders} discounted limit buy orders.")
+                    for i in range(max_buy_orders):
+                        # Calculate buy price with a significant discount to ensure profitability
+                        # Use larger discounts in bearish markets
+                        discount = Decimal("0.01") + Decimal(str(i * 0.005))  # Start with 1% discount
+                        buy_price = (mid_price * (Decimal("1.0") - discount)).quantize(price_precision)
+                        
+                        # If we have average sell price, make sure our buy price is sufficiently lower
+                        if self.filled_sell_prices and len(self.filled_sell_prices) > 0:
+                            avg_sell = sum(self.filled_sell_prices) / len(self.filled_sell_prices)
+                            max_buy_price = avg_sell * (Decimal("1.0") - Decimal("0.005"))  # At least 0.5% below avg sell
+                            if buy_price > max_buy_price:
+                                buy_price = max_buy_price.quantize(price_precision)
+                        
+                        self.logger().info(f"Discounted buy order {i+1} price: {buy_price} (discount: {discount*100}%)")
+                        
+                        orders.append(OrderCandidate(
+                            trading_pair=self.trading_pair,
+                            is_maker=True,
+                            order_type=OrderType.LIMIT,
+                            order_side=TradeType.BUY,
+                            amount=self.order_amount,
+                            price=buy_price
+                        ))
+        
+        # SELL LOGIC - Completely separated and with strict profit enforcement
+        # Only place sell orders if we have ETH to sell and have completed buys
+        if current_eth >= self.order_amount and self.total_buys > self.total_sells and avg_buy_price is not None:
             sell_imbalance = self.total_buys - self.total_sells
             max_sell_orders = min(sell_imbalance, available_order_slots)
             max_sell_orders = min(max_sell_orders, int(current_eth / self.order_amount))
             
             if max_sell_orders > 0:
-                self.logger().info(f"Placing {max_sell_orders} limit sell orders")
-                for i in range(max_sell_orders):
-                    # Calculate sell price with markup
-                    # Use a higher markup to ensure profitability after fees
-                    markup = self.min_markup + Decimal(str(i * 0.001))
-                    sell_price = (mid_price * (Decimal("1.0") + markup)).quantize(price_precision)
-                    
-                    # If we have filled buy prices, ensure we're selling above our average buy
-                    if self.filled_buy_prices:
-                        avg_buy = sum(self.filled_buy_prices) / len(self.filled_buy_prices)
-                        min_sell_price = avg_buy * (Decimal("1.0") + self.min_markup)
-                        if sell_price < min_sell_price:
-                            sell_price = min_sell_price.quantize(price_precision)
-                    
-                    self.logger().info(f"Expected sell price for order {i+1}: {sell_price}")
-                    
-                    orders.append(OrderCandidate(
-                        trading_pair=self.trading_pair,
-                        is_maker=True,
-                        order_type=OrderType.LIMIT,
-                        order_side=TradeType.SELL,
-                        amount=self.order_amount,
-                        price=sell_price
-                    ))
+                # Calculate minimum profitable sell price with a 1% markup over average buy price
+                # This is higher than before to ensure profitability
+                min_markup = Decimal("0.01")  # 1% minimum markup
+                min_sell_price = avg_buy_price * (Decimal("1.0") + min_markup)
+                
+                # Only place sell orders if current market price is above our minimum sell price
+                if mid_price >= min_sell_price:
+                    self.logger().info(f"Placing {max_sell_orders} limit sell orders with guaranteed profit")
+                    for i in range(max_sell_orders):
+                        # Calculate sell price with increasing markup
+                        markup = min_markup + Decimal(str(i * 0.003))  # Increased markup steps
+                        sell_price = (avg_buy_price * (Decimal("1.0") + markup)).quantize(price_precision)
+                        
+                        # Double-check that sell price is above avg buy price with markup
+                        if sell_price <= avg_buy_price:
+                            self.logger().warning(f"Calculated sell price {sell_price} not profitable compared to avg buy {avg_buy_price}. Adjusting.")
+                            sell_price = (avg_buy_price * (Decimal("1.0") + min_markup + Decimal("0.005"))).quantize(price_precision)
+                        
+                        self.logger().info(f"Limit sell order {i+1} price: {sell_price} (markup: {markup*100}% above avg buy of {avg_buy_price})")
+                        
+                        orders.append(OrderCandidate(
+                            trading_pair=self.trading_pair,
+                            is_maker=True,
+                            order_type=OrderType.LIMIT,
+                            order_side=TradeType.SELL,
+                            amount=self.order_amount,
+                            price=sell_price
+                        ))
+                else:
+                    self.logger().info(f"Current price ({mid_price}) is below minimum profitable sell price ({min_sell_price}). Not placing sell orders.")
         
         self.logger().info(f"Proposal created with {len(orders)} orders. Total active orders will be {current_active_orders + len(orders)}")
         return orders
